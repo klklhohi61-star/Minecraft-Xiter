@@ -8,15 +8,15 @@ services:
     healthCheckPath: /health
     envVars:
       - key: BOT_HOST
-        sync: false          # your server address, e.g. my-server.falixsrv.me
+        value: villainsmpknowledge.falixsrv.me
       - key: BOT_PORT
-        value: "25565"
+        value: "20013"
       - key: BOT_USERNAME
         value: XiterBot
       - key: MC_VERSION
         value: "1.20.1"
       - key: BOT_AUTH
-        value: offline       # change to 'microsoft' for premium accounts
+        value: offline
       - key: RECONNECT_DELAY
         value: "10000"
       - key: AFK_INTERVAL
