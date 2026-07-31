@@ -3,17 +3,20 @@ const mineflayer = require('mineflayer');
 const express    = require('express');
 const net        = require('net');
 
-// ─── Server list ──────────────────────────────────────────────────────────────
-// Priority order — bot tries each in turn, stops as soon as one works.
-// Override with BOT_SERVERS env var: "host1:port1,host2:port2"
+// ─── Process-level crash guard ────────────────────────────────────────────────
+// Keeps Render's free-tier process alive even on unexpected errors.
+process.on('uncaughtException',  err  => _log('[CRASH] Uncaught exception:', err.message, err.stack));
+process.on('unhandledRejection', (r)  => _log('[CRASH] Unhandled rejection:', r));
+
+// ─── Server pool ──────────────────────────────────────────────────────────────
+// Tried in order. Bot locks onto whichever it spawns on.
+// Override via BOT_SERVERS="host1:port1,host2:port2"
 function parseServers() {
   if (process.env.BOT_SERVERS) {
-    return process.env.BOT_SERVERS.split(',').map(s => {
-      const [host, port] = s.trim().split(':');
-      return { host: host.trim(), port: parseInt(port) || 25565 };
-    }).filter(s => s.host);
+    return process.env.BOT_SERVERS.split(',')
+      .map(s => { const [h, p] = s.trim().split(':'); return { host: h.trim(), port: parseInt(p) || 25565 }; })
+      .filter(s => s.host);
   }
-  // Default list — add / remove lines here
   return [
     { host: process.env.BOT_HOST || 'villainsmpknowledge.falixsrv.me', port: parseInt(process.env.BOT_PORT || '20013') },
     { host: '162.55.28.90', port: 20008 },
@@ -21,36 +24,35 @@ function parseServers() {
 }
 const SERVERS = parseServers();
 
-// ─── Bot config ───────────────────────────────────────────────────────────────
-const USERNAME     = process.env.BOT_USERNAME || 'XiterBot';
-const VERSION      = process.env.MC_VERSION   || '1.20.1';
-const AUTH         = process.env.BOT_AUTH     || 'offline';
-const OWNER        = process.env.OWNER_USERNAME || '';
-const PREFIX       = process.env.CHAT_PREFIX    || '!';
-
+// ─── Config ───────────────────────────────────────────────────────────────────
+const USERNAME          = process.env.BOT_USERNAME      || 'XiterBot';
+const VERSION           = process.env.MC_VERSION        || '1.20.1';
+const AUTH              = process.env.BOT_AUTH          || 'offline';
+const OWNER             = process.env.OWNER_USERNAME    || '';
+const PREFIX            = process.env.CHAT_PREFIX       || '!';
 const RECONNECT_BASE_MS = parseInt(process.env.RECONNECT_DELAY || '15000');
 const AFK_INTERVAL_MS   = parseInt(process.env.AFK_INTERVAL    || '30000');
 const TCP_TIMEOUT_MS    = 8000;
+const SPAWN_TIMEOUT_MS  = 30000;   // give up if spawn doesn't fire within 30s
+const MAX_LOCK_FAILS    = 5;       // unlock after this many consecutive failures on locked server
 
 // ─── State ────────────────────────────────────────────────────────────────────
-let botStatus      = 'starting';
-let botStartTime   = Date.now();
-let reconnectCount = 0;
-let reconnectDelay = RECONNECT_BASE_MS;
-let lastError      = '';
-let activeServer   = SERVERS[0];        // which server we're currently on/trying
-let lockedIn       = false;             // true once bot has spawned — stay on this server
-let chatLog        = [];
-let deviceAuth     = null;
-let afkTimer       = null;
-let reconnectTimer = null;
+let botStatus       = 'starting';
+let botStartTime    = Date.now();
+let reconnectCount  = 0;
+let reconnectDelay  = RECONNECT_BASE_MS;
+let lockFailCount   = 0;           // consecutive failures while locked in
+let lastError       = '';
+let activeServer    = SERVERS[0];
+let lockedIn        = false;
+let chatLog         = [];
+let deviceAuth      = null;
+let afkTimer        = null;
+let spawnTimeout    = null;
+let reconnectTimer  = null;
+let currentBotId    = 0;           // incremented each time we create a bot — lets old event handlers self-invalidate
 
-function addLog(source, username, message) {
-  chatLog.push({ ts: Date.now(), source, username, message });
-  if (chatLog.length > 50) chatLog.shift();
-}
-
-// Capture prismarine-auth device-code output
+// ─── Logging — intercept for prismarine-auth device-code ─────────────────────
 const _log = console.log.bind(console);
 console.log = (...args) => {
   const msg = args.join(' ');
@@ -64,6 +66,11 @@ console.log = (...args) => {
   _log(...args);
 };
 
+function addLog(source, username, message) {
+  chatLog.push({ ts: Date.now(), source, username, message });
+  if (chatLog.length > 50) chatLog.shift();
+}
+
 // ─── TCP ping ─────────────────────────────────────────────────────────────────
 function tcpPing(host, port, ms) {
   return new Promise(resolve => {
@@ -72,36 +79,41 @@ function tcpPing(host, port, ms) {
     const finish = (ok, reason) => { if (done) return; done = true; sock.destroy(); resolve({ ok, reason }); };
     sock.setTimeout(ms);
     sock.connect(port, host, () => finish(true, 'open'));
-    sock.on('error',   e => finish(false, e.message));
-    sock.on('timeout', () => finish(false, 'Timed out — server may be offline'));
+    sock.on('error',   e => finish(false, e.code === 'ECONNREFUSED' ? 'Connection refused — server offline?' : e.message));
+    sock.on('timeout', () => finish(false, 'Timed out — server not responding'));
   });
 }
 
 // ─── Find a reachable server ──────────────────────────────────────────────────
-// If locked in (already spawned once), only check the active server.
-// Otherwise walk the full list and return the first one that responds.
 async function findServer() {
-  const list = lockedIn ? [activeServer] : SERVERS;
+  // If locked and not over the fail threshold, only check the active server
+  const list = (lockedIn && lockFailCount < MAX_LOCK_FAILS) ? [activeServer] : SERVERS;
+  if (lockedIn && lockFailCount >= MAX_LOCK_FAILS) {
+    _log(`[Bot] ${MAX_LOCK_FAILS} consecutive lock failures — unlocking and scanning all servers`);
+    lockedIn      = false;
+    lockFailCount = 0;
+    reconnectDelay = RECONNECT_BASE_MS;
+  }
   for (const srv of list) {
     _log(`[Net] Pinging ${srv.host}:${srv.port}…`);
     const { ok, reason } = await tcpPing(srv.host, srv.port, TCP_TIMEOUT_MS);
     if (ok) return { server: srv, error: null };
-    _log(`[Net] ${srv.host}:${srv.port} — ${reason}`);
+    _log(`[Net] ${srv.host}:${srv.port} unreachable — ${reason}`);
   }
   return { server: null, error: 'All servers unreachable' };
 }
 
 // ─── Web dashboard ────────────────────────────────────────────────────────────
-const app     = express();
+const app      = express();
 const WEB_PORT = process.env.PORT || 3000;
 app.use(express.json());
-
 app.get('/',           (_req, res) => res.send(dashboardHTML()));
 app.get('/health',     (_req, res) => res.send('OK'));
 app.get('/api/status', (_req, res) => res.json({
   status:      botStatus,
   server:      activeServer.host + ':' + activeServer.port,
   lockedIn,
+  lockFailCount,
   servers:     SERVERS.map(s => s.host + ':' + s.port),
   username:    USERNAME,
   auth:        AUTH,
@@ -113,56 +125,102 @@ app.get('/api/status', (_req, res) => res.json({
   deviceAuth:  deviceAuth && Date.now() < deviceAuth.expiresAt ? deviceAuth : null,
   chatLog:     chatLog.slice(-20),
 }));
-
 app.listen(WEB_PORT, () => _log('[Web] Dashboard → http://localhost:' + WEB_PORT));
 
 // ─── Anti-AFK ─────────────────────────────────────────────────────────────────
 const afkActions = [
-  b => { b.setControlState('jump',    true); setTimeout(() => b.setControlState('jump',    false), 500); },
-  b => { b.setControlState('sneak',   true); setTimeout(() => b.setControlState('sneak',   false), 800); },
-  b => { b.setControlState('forward', true); setTimeout(() => b.setControlState('forward', false), 600); },
-  b => { b.setControlState('back',    true); setTimeout(() => b.setControlState('back',    false), 600); },
-  b => { b.setControlState('left',    true); setTimeout(() => b.setControlState('left',    false), 600); },
-  b => { b.setControlState('right',   true); setTimeout(() => b.setControlState('right',   false), 600); },
-  b => { b.look((Math.random() * 2 - 1) * Math.PI, 0, false); },
+  b => { b.setControlState('jump',    true); setTimeout(() => { try { b.setControlState('jump',    false); } catch(_){} }, 500); },
+  b => { b.setControlState('sneak',   true); setTimeout(() => { try { b.setControlState('sneak',   false); } catch(_){} }, 800); },
+  b => { b.setControlState('forward', true); setTimeout(() => { try { b.setControlState('forward', false); } catch(_){} }, 600); },
+  b => { b.setControlState('back',    true); setTimeout(() => { try { b.setControlState('back',    false); } catch(_){} }, 600); },
+  b => { b.setControlState('left',    true); setTimeout(() => { try { b.setControlState('left',    false); } catch(_){} }, 600); },
+  b => { b.setControlState('right',   true); setTimeout(() => { try { b.setControlState('right',   false); } catch(_){} }, 600); },
+  b => { if (b.entity) b.look((Math.random() * 2 - 1) * Math.PI, 0, false); },
   b => { b.swingArm('right'); },
   b => { b.swingArm('left');  },
-  b => { let n = 0; const id = setInterval(() => { try { b.look(b.entity.yaw + Math.PI / 8, 0, false); } catch(_) { clearInterval(id); } if (++n >= 16) clearInterval(id); }, 60); },
+  b => {
+    if (!b.entity) return;
+    let n = 0;
+    const id = setInterval(() => {
+      try { if (b.entity) b.look(b.entity.yaw + Math.PI / 8, 0, false); else clearInterval(id); }
+      catch(_) { clearInterval(id); }
+      if (++n >= 16) clearInterval(id);
+    }, 60);
+  },
 ];
 const afkChat = ['.', 'AFK', 'I am here', 'Still online'];
 let chatIdx = 0;
+
 function doAFK(bot) {
-  try { afkActions[Math.floor(Math.random() * afkActions.length)](bot); } catch(_) {}
-  if (Math.random() < 0.08) try { bot.chat(afkChat[chatIdx++ % afkChat.length]); } catch(_) {}
+  // Safety: skip if bot entity isn't ready
+  if (!bot || !bot.entity) return;
+  const action = afkActions[Math.floor(Math.random() * afkActions.length)];
+  try { action(bot); } catch(_) {}
+  if (Math.random() < 0.08) {
+    try { bot.chat(afkChat[chatIdx++ % afkChat.length]); } catch(_) {}
+  }
+}
+
+function clearAllControlStates(bot) {
+  // Ensure no movement keys are stuck when the bot disconnects
+  const states = ['forward', 'back', 'left', 'right', 'jump', 'sneak', 'sprint'];
+  for (const s of states) try { bot.setControlState(s, false); } catch(_) {}
 }
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 function handleCmd(bot, sender, msg) {
-  const p = PREFIX, owner = !OWNER || sender === OWNER;
-  if      (msg === p+'ping')   bot.chat('Pong! 🏓');
-  else if (msg === p+'status') { const u=Math.floor((Date.now()-botStartTime)/1000); bot.chat(`Up ${Math.floor(u/3600)}h${Math.floor((u%3600)/60)}m${u%60}s | Reconnects: ${reconnectCount} | Server: ${activeServer.host}:${activeServer.port}`); }
-  else if (msg === p+'pos')    { const p2=bot.entity.position; bot.chat(`Pos: ${Math.floor(p2.x)}, ${Math.floor(p2.y)}, ${Math.floor(p2.z)}`); }
-  else if (msg === p+'health') bot.chat(`HP: ${bot.health?.toFixed(1)??'?'}/20  Food: ${bot.food??'?'}/20`);
-  else if (msg === p+'players') { const n=Object.keys(bot.players).filter(x=>x!==bot.username); bot.chat(n.length?'Online: '+n.slice(0,10).join(', '):'No other players.'); }
-  else if (msg === p+'servers') bot.chat('Servers: '+SERVERS.map(s=>s.host+':'+s.port).join(' | '));
-  else if (msg === p+'help')   bot.chat(`Commands: ${p}ping ${p}status ${p}pos ${p}health ${p}players ${p}servers${owner?` ${p}stop ${p}reconnect`:''}`);
-  else if (msg === p+'reconnect' && owner) { bot.chat('Reconnecting…'); lockedIn = false; setTimeout(() => { try { bot.quit(); } catch(_){} }, 500); }
-  else if (msg === p+'stop'      && owner) { bot.chat('Stopping. Goodbye!'); setTimeout(() => process.exit(0), 1000); }
+  const p = PREFIX;
+  const isOwner = !OWNER || sender === OWNER;
+  try {
+    if (msg === p + 'ping') {
+      bot.chat('Pong! 🏓');
+    } else if (msg === p + 'status') {
+      const u = Math.floor((Date.now() - botStartTime) / 1000);
+      bot.chat(`Up ${Math.floor(u/3600)}h${Math.floor((u%3600)/60)}m${u%60}s | Reconnects: ${reconnectCount} | ${activeServer.host}:${activeServer.port}`);
+    } else if (msg === p + 'pos') {
+      const p2 = bot.entity?.position;
+      bot.chat(p2 ? `Pos: ${Math.floor(p2.x)}, ${Math.floor(p2.y)}, ${Math.floor(p2.z)}` : 'Position unknown');
+    } else if (msg === p + 'health') {
+      bot.chat(`HP: ${bot.health?.toFixed(1) ?? '?'}/20  Food: ${bot.food ?? '?'}/20`);
+    } else if (msg === p + 'players') {
+      const names = Object.keys(bot.players || {}).filter(n => n !== bot.username);
+      bot.chat(names.length ? 'Online: ' + names.slice(0, 10).join(', ') : 'No other players.');
+    } else if (msg === p + 'servers') {
+      bot.chat('Pool: ' + SERVERS.map(s => s.host + ':' + s.port).join(' | '));
+    } else if (msg === p + 'help') {
+      bot.chat(`Commands: ${p}ping ${p}status ${p}pos ${p}health ${p}players ${p}servers${isOwner ? ` ${p}stop ${p}reconnect` : ''}`);
+    } else if (msg === p + 'reconnect' && isOwner) {
+      bot.chat('Reconnecting and scanning all servers…');
+      lockedIn      = false;
+      lockFailCount = 0;
+      reconnectDelay = RECONNECT_BASE_MS;
+      setTimeout(() => { try { bot.quit(); } catch(_) {} }, 500);
+    } else if (msg === p + 'stop' && isOwner) {
+      bot.chat('Stopping. Goodbye!');
+      setTimeout(() => process.exit(0), 1000);
+    }
+  } catch(_) {}
 }
 
 // ─── Bot factory ──────────────────────────────────────────────────────────────
 async function connectBot() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
-  // 1. Find a reachable server
+  // Give each bot instance a unique ID so stale event handlers can self-invalidate
+  const myId = ++currentBotId;
+
+  // 1. TCP-check servers
   botStatus = 'checking_servers';
   lastError = '';
   const { server, error } = await findServer();
+
+  if (myId !== currentBotId) return; // superseded by a newer call
 
   if (!server) {
     lastError = error || 'All servers unreachable';
     _log('[Bot]', lastError);
     botStatus = 'server_offline';
+    lockFailCount++;
     addLog('system', 'Bot', lastError);
     scheduleReconnect();
     return;
@@ -173,84 +231,120 @@ async function connectBot() {
   botStatus  = 'connecting';
   deviceAuth = null;
 
-  // 2. Create mineflayer bot
+  // 2. Create bot
   let bot;
   try {
-    bot = mineflayer.createBot({ host: server.host, port: server.port, username: USERNAME, version: VERSION, auth: AUTH });
+    bot = mineflayer.createBot({
+      host:     server.host,
+      port:     server.port,
+      username: USERNAME,
+      version:  VERSION,
+      auth:     AUTH,
+      hideErrors: false,
+    });
   } catch (err) {
+    if (myId !== currentBotId) return;
     lastError = err.message;
     _log('[Bot] createBot error:', err.message);
+    lockFailCount++;
     scheduleReconnect();
     return;
   }
 
-  // 3. Spawned — lock in, start AFK
+  // 3. Spawn timeout — if server accepts TCP but login hangs, give up after 30s
+  spawnTimeout = setTimeout(() => {
+    if (myId !== currentBotId) return;
+    _log('[Bot] Spawn timeout — login hung, reconnecting…');
+    lastError = 'Spawn timeout — server accepted connection but did not complete login';
+    lockFailCount++;
+    cleanup('timed out');
+    scheduleReconnect();
+  }, SPAWN_TIMEOUT_MS);
+
+  // 4. Spawned successfully
   bot.once('spawn', () => {
+    if (myId !== currentBotId) { try { bot.quit(); } catch(_) {} return; }
+    if (spawnTimeout) { clearTimeout(spawnTimeout); spawnTimeout = null; }
     _log(`[Bot] Spawned on ${server.host}:${server.port}! Locked in. Anti-AFK active.`);
     botStatus      = 'online';
     lastError      = '';
-    lockedIn       = true;          // ← stay on this server from now on
-    reconnectDelay = RECONNECT_BASE_MS;  // reset backoff
+    lockedIn       = true;
+    lockFailCount  = 0;
+    reconnectDelay = RECONNECT_BASE_MS;
     deviceAuth     = null;
-    afkTimer = setInterval(() => doAFK(bot), AFK_INTERVAL_MS);
+    afkTimer = setInterval(() => { if (myId === currentBotId) doAFK(bot); }, AFK_INTERVAL_MS);
     addLog('system', 'Bot', `Connected to ${server.host}:${server.port}`);
   });
 
-  // 4. Chat / whisper
-  const onChat = (u, m) => {
-    if (u === bot.username) return;
+  // 5. Chat
+  bot.on('chat', (u, m) => {
+    if (myId !== currentBotId || u === bot.username) return;
     _log(`[Chat] <${u}> ${m}`);
     addLog('chat', u, m);
-    if (m.startsWith(PREFIX)) try { handleCmd(bot, u, m); } catch(_) {}
-  };
-  const onWhisper = (u, m) => {
+    if (m.startsWith(PREFIX)) handleCmd(bot, u, m);
+  });
+  bot.on('whisper', (u, m) => {
+    if (myId !== currentBotId) return;
     _log(`[Whisper] ${u}: ${m}`);
     addLog('whisper', u, m);
-    if (m.startsWith(PREFIX)) try { handleCmd(bot, u, m); } catch(_) {}
-  };
-  bot.on('chat',    onChat);
-  bot.on('whisper', onWhisper);
+    if (m.startsWith(PREFIX)) handleCmd(bot, u, m);
+  });
 
-  // 5. Disconnect events
+  // 6. Disconnect — use a single `dead` flag to prevent double-handling
+  let dead = false;
+  function onDisconnect(status, reason) {
+    if (dead || myId !== currentBotId) return;
+    dead = true;
+    if (spawnTimeout) { clearTimeout(spawnTimeout); spawnTimeout = null; }
+    lastError = reason || '';
+    botStatus  = status;
+    _log(`[Bot] ${status}: ${reason}`);
+    if (reason) addLog('system', 'Bot', `${status}: ${reason}`);
+    if (status !== 'online') lockFailCount++;
+    cleanup(reason);
+    scheduleReconnect();
+  }
+
   bot.on('kicked', reason => {
     const r = typeof reason === 'string' ? reason : JSON.stringify(reason);
-    lastError = 'Kicked: ' + r;
-    _log('[Bot] Kicked:', r);
-    botStatus = 'kicked';
-    addLog('system', 'Bot', 'Kicked: ' + r);
-    cleanup(); scheduleReconnect();
+    onDisconnect('kicked', r);
   });
-  bot.on('error', err => {
-    lastError = err.message;
-    _log('[Bot] Error:', err.message);
-    botStatus = 'error';
-    cleanup(); scheduleReconnect();
-  });
-  bot.on('end', reason => {
-    _log('[Bot] Ended:', reason);
-    lastError = reason || '';
-    botStatus = 'disconnected';
-    addLog('system', 'Bot', 'Disconnected: ' + reason);
-    cleanup(); scheduleReconnect();
-  });
+  bot.on('error', err => onDisconnect('error', err.message));
+  bot.on('end',   reason => onDisconnect('disconnected', reason || 'Connection ended'));
 
-  function cleanup() {
+  // 7. Cleanup for this bot instance
+  function cleanup(reason) {
+    // Clear AFK timer first so no more AFK actions fire on a dead bot
     if (afkTimer) { clearInterval(afkTimer); afkTimer = null; }
-    try { bot.removeAllListeners(); } catch(_) {}
+    // Try to clear control states to prevent stuck keys
+    try { clearAllControlStates(bot); } catch(_) {}
+    // Gracefully end the bot; don't removeAllListeners (breaks mineflayer internals)
+    try { bot.end(reason || 'cleanup'); } catch(_) {}
   }
 }
 
 function scheduleReconnect() {
-  if (reconnectTimer) return;
+  if (reconnectTimer) return; // already scheduled — don't stack
   reconnectCount++;
-  _log(`[Bot] Retry #${reconnectCount} in ${reconnectDelay / 1000}s (locked=${lockedIn})…`);
+  const delaySec = Math.round(reconnectDelay / 1000);
+  _log(`[Bot] Retry #${reconnectCount} in ${delaySec}s (locked=${lockedIn}, lockFails=${lockFailCount})…`);
   botStatus = 'waiting_to_reconnect';
-  reconnectTimer = setTimeout(() => { reconnectTimer = null; connectBot(); }, reconnectDelay);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectBot().catch(err => {
+      _log('[Bot] connectBot threw:', err.message);
+      scheduleReconnect();
+    });
+  }, reconnectDelay);
   // Exponential backoff: 15 → 30 → 60 → 120s cap
   reconnectDelay = Math.min(reconnectDelay * 2, 120_000);
 }
 
-connectBot();
+// ─── Start ────────────────────────────────────────────────────────────────────
+connectBot().catch(err => {
+  _log('[Bot] Initial connect failed:', err.message);
+  scheduleReconnect();
+});
 
 // ─── Dashboard HTML ───────────────────────────────────────────────────────────
 function dashboardHTML() {
@@ -265,7 +359,7 @@ return `<!DOCTYPE html>
 body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}
 header{background:var(--card);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;align-items:center;gap:12px}
 header h1{font-size:1.2rem;font-weight:700}
-header span{font-size:.76rem;color:var(--muted);margin-left:auto}
+header span{font-size:.75rem;color:var(--muted);margin-left:auto}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:20px 24px;max-width:1100px;margin:0 auto}
 @media(max-width:680px){.grid{grid-template-columns:1fr}}
 .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 20px}
@@ -278,33 +372,32 @@ header span{font-size:.76rem;color:var(--muted);margin-left:auto}
 .server_offline{background:rgba(251,146,60,.12);color:var(--orange)}.server_offline .dot{background:var(--orange)}
 .disconnected{background:rgba(100,116,139,.15);color:var(--muted)}.disconnected .dot{background:var(--muted)}
 @keyframes p{0%,100%{opacity:1}50%{opacity:.35}}
-.error-box{background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.25);border-radius:8px;padding:10px 12px;margin-top:10px;font-size:.81rem;color:var(--red);word-break:break-all}
-.offline-box{background:rgba(251,146,60,.08);border:1px solid rgba(251,146,60,.25);border-radius:8px;padding:10px 12px;margin-top:10px;font-size:.81rem;color:var(--orange)}
-.offline-box ul{margin-left:16px;margin-top:4px;line-height:1.8}
-.lock-badge{display:inline-flex;align-items:center;gap:5px;font-size:.75rem;padding:2px 8px;border-radius:999px;margin-left:8px}
-.locked{background:rgba(167,139,250,.15);color:var(--purple)}
-.unlocked{background:rgba(100,116,139,.12);color:var(--muted)}
-.stat-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);font-size:.86rem}
+.err-box{background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.25);border-radius:8px;padding:10px 12px;margin-top:10px;font-size:.8rem;color:var(--red);word-break:break-all}
+.off-box{background:rgba(251,146,60,.08);border:1px solid rgba(251,146,60,.25);border-radius:8px;padding:10px 12px;margin-top:10px;font-size:.8rem;color:var(--orange)}
+.off-box ul{margin-left:16px;margin-top:4px;line-height:1.8}
+.lock-badge{display:inline-flex;align-items:center;gap:5px;font-size:.74rem;padding:2px 8px;border-radius:999px;margin-left:8px}
+.locked{background:rgba(167,139,250,.15);color:var(--purple)}.unlocked{background:rgba(100,116,139,.12);color:var(--muted)}
+.stat-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);font-size:.85rem}
 .stat-row:last-child{border-bottom:none}.stat-row .label{color:var(--muted)}
-.server-list{margin-top:8px;display:flex;flex-direction:column;gap:4px}
-.server-item{font-size:.8rem;padding:5px 10px;border-radius:6px;border:1px solid var(--border);display:flex;align-items:center;gap:8px}
-.server-item.active{border-color:var(--green);background:rgba(74,222,128,.06)}
-.server-item.active .sdot{background:var(--green);box-shadow:0 0 4px var(--green)}
+.srv-list{margin-top:8px;display:flex;flex-direction:column;gap:4px}
+.srv-item{font-size:.79rem;padding:5px 10px;border-radius:6px;border:1px solid var(--border);display:flex;align-items:center;gap:8px}
+.srv-item.active{border-color:var(--green);background:rgba(74,222,128,.06)}
+.srv-item.active .sdot{background:var(--green);box-shadow:0 0 4px var(--green);animation:p 2s infinite}
 .sdot{width:6px;height:6px;border-radius:50%;background:var(--muted);flex-shrink:0}
 .auth-box{background:rgba(250,204,21,.08);border:1px solid rgba(250,204,21,.3);border-radius:10px;padding:14px;margin-top:8px}
 .auth-box h3{color:var(--yellow);font-size:.9rem;margin-bottom:8px}
 .code{font-family:monospace;font-size:1.4rem;letter-spacing:.2em;color:var(--yellow);font-weight:700}
 .auth-box a{color:var(--blue);font-size:.84rem}
 .chat-log{height:230px;overflow-y:auto;display:flex;flex-direction:column;gap:3px}
-.chat-entry{font-size:.8rem;line-height:1.4;padding:2px 0}
-.chat-entry .time{color:var(--muted);margin-right:5px;font-size:.72rem}
+.chat-entry{font-size:.79rem;line-height:1.4;padding:2px 0}
+.chat-entry .time{color:var(--muted);margin-right:5px;font-size:.71rem}
 .chat-entry .user{font-weight:600}
 .chat-entry.chat .user{color:var(--green)}.chat-entry.whisper .user{color:var(--blue)}.chat-entry.system .user{color:var(--muted);font-style:italic}
 .chat-log::-webkit-scrollbar{width:4px}.chat-log::-webkit-scrollbar-thumb{background:var(--muted);border-radius:2px}
 .wide{grid-column:1/-1}
-.uptime{font-size:1.45rem;font-weight:700;color:var(--green)}
-.commands code{display:inline-block;background:rgba(96,165,250,.1);color:var(--blue);border:1px solid rgba(96,165,250,.2);border-radius:6px;padding:2px 8px;font-size:.77rem;margin:2px}
-footer{text-align:center;color:var(--muted);font-size:.72rem;padding:24px}
+.uptime{font-size:1.4rem;font-weight:700;color:var(--green)}
+.cmds code{display:inline-block;background:rgba(96,165,250,.1);color:var(--blue);border:1px solid rgba(96,165,250,.2);border-radius:6px;padding:2px 8px;font-size:.76rem;margin:2px}
+footer{text-align:center;color:var(--muted);font-size:.71rem;padding:24px}
 </style>
 </head>
 <body>
@@ -325,40 +418,35 @@ footer{text-align:center;color:var(--muted);font-size:.72rem;padding:24px}
 </header>
 
 <div class="grid">
-  <!-- Status -->
   <div class="card">
     <h2>Bot Status</h2>
-    <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px">
+    <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:4px">
       <div id="badge" class="badge starting"><span class="dot"></span><span id="status-text">Starting…</span></div>
       <span id="lock-badge" class="lock-badge unlocked">🔓 scanning</span>
     </div>
-    <div id="error-box" style="display:none" class="error-box"></div>
-    <div id="offline-box" style="display:none" class="offline-box">
+    <div id="err-box"  style="display:none" class="err-box"></div>
+    <div id="off-box"  style="display:none" class="off-box">
       <strong>All servers unreachable.</strong>
       <ul>
-        <li>Start your server on <a href="https://client.falixnodes.net" target="_blank" style="color:var(--orange)">FalixNodes</a></li>
-        <li>Bot will keep retrying all addresses automatically</li>
+        <li>Start your server at <a href="https://client.falixnodes.net" target="_blank" style="color:var(--orange)">FalixNodes</a></li>
+        <li>Bot retries automatically every retry cycle</li>
       </ul>
     </div>
     <div id="auth-box" style="display:none" class="auth-box">
       <h3>🔑 Microsoft Login Required</h3>
-      <p>Open the link and enter this code:</p>
+      <p>Enter this code at the link below:</p>
       <div class="code" id="device-code">——</div>
       <a id="device-uri" href="#" target="_blank">Open microsoft.com/devicelogin ↗</a>
-      <p id="device-expires" style="font-size:.78rem;color:var(--muted);margin-top:5px"></p>
+      <p id="device-exp" style="font-size:.77rem;color:var(--muted);margin-top:5px"></p>
     </div>
   </div>
 
-  <!-- Server list -->
   <div class="card">
     <h2>Server Pool</h2>
-    <div class="server-list" id="server-list">Loading…</div>
-    <p style="font-size:.74rem;color:var(--muted);margin-top:10px">
-      Once the bot spawns it locks onto that server. Use <code style="background:rgba(255,255,255,.06);padding:1px 5px;border-radius:4px">!reconnect</code> to scan again.
-    </p>
+    <div class="srv-list" id="srv-list">Loading…</div>
+    <p style="font-size:.73rem;color:var(--muted);margin-top:10px">Locks onto first server that responds. After <strong>5 consecutive failures</strong> it unlocks and scans all again.</p>
   </div>
 
-  <!-- Stats -->
   <div class="card">
     <h2>Stats</h2>
     <div id="uptime" class="uptime">—</div>
@@ -367,93 +455,82 @@ footer{text-align:center;color:var(--muted);font-size:.72rem;padding:24px}
       <div class="stat-row"><span class="label">Auth</span><span class="value" id="s-auth">—</span></div>
       <div class="stat-row"><span class="label">Version</span><span class="value" id="s-ver">—</span></div>
       <div class="stat-row"><span class="label">Reconnects</span><span class="value" id="s-rc">0</span></div>
+      <div class="stat-row"><span class="label">Lock failures</span><span class="value" id="s-lf">0 / 5</span></div>
       <div class="stat-row"><span class="label">Next retry in</span><span class="value" id="s-retry">—</span></div>
     </div>
   </div>
 
-  <!-- Chat log -->
   <div class="card">
     <h2>Chat Log</h2>
     <div class="chat-log" id="chat-log"><span style="color:var(--muted);font-size:.8rem">Waiting for messages…</span></div>
   </div>
 
-  <!-- Commands -->
   <div class="card wide">
     <h2>In-game Commands</h2>
-    <div class="commands">
+    <div class="cmds">
       <code>!ping</code><code>!status</code><code>!pos</code><code>!health</code>
       <code>!players</code><code>!servers</code><code>!help</code>
-      <code>!reconnect</code> (owner)<code>!stop</code> (owner)
+      <code>!reconnect</code><span style="color:var(--muted);font-size:.76rem"> owner</span>
+      <code>!stop</code><span style="color:var(--muted);font-size:.76rem"> owner</span>
     </div>
-    <p style="font-size:.75rem;color:var(--muted);margin-top:8px">
-      Set <code>OWNER_USERNAME</code> to your in-game name to unlock admin commands. <code>!servers</code> lists the full fallback pool.
-    </p>
+    <p style="font-size:.74rem;color:var(--muted);margin-top:8px">Set <code style="background:rgba(255,255,255,.06);padding:1px 5px;border-radius:4px">OWNER_USERNAME</code> env var to your IGN to unlock admin commands.</p>
   </div>
 </div>
 
-<footer>Minecraft-Xiter — multi-server AFK bot for FalixNodes / Render.com</footer>
+<footer>Minecraft-Xiter — optimized AFK bot · FalixNodes / Render.com</footer>
 
 <script>
 const fmt = s => (Math.floor(s/3600)?Math.floor(s/3600)+'h ':'')+(Math.floor((s%3600)/60)?Math.floor((s%3600)/60)+'m ':'')+(s%60)+'s';
-const fmtT = ts => { const d=new Date(ts); return [d.getHours(),d.getMinutes(),d.getSeconds()].map(n=>String(n).padStart(2,'0')).join(':'); };
+const fmtT = ts => new Date(ts).toTimeString().slice(0,8);
 const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 let lastLen = 0;
 
 async function poll() {
   try {
     const d = await fetch('/api/status').then(r => r.json());
-
-    // Badge
     document.getElementById('badge').className = 'badge ' + d.status;
     document.getElementById('status-text').textContent = d.status.replace(/_/g,' ');
 
-    // Lock badge
     const lb = document.getElementById('lock-badge');
-    lb.className = 'lock-badge ' + (d.lockedIn ? 'locked' : 'unlocked');
-    lb.textContent = d.lockedIn ? '🔒 locked: ' + d.server : '🔓 scanning servers';
+    lb.className = 'lock-badge ' + (d.lockedIn?'locked':'unlocked');
+    lb.textContent = d.lockedIn ? '🔒 locked: '+d.server : '🔓 scanning all servers';
 
-    // Error / offline boxes
-    const eb = document.getElementById('error-box');
-    const ob = document.getElementById('offline-box');
-    if (d.status === 'server_offline') { ob.style.display='block'; eb.style.display='none'; }
-    else if (d.lastError && d.status !== 'online') { eb.textContent=d.lastError; eb.style.display='block'; ob.style.display='none'; }
+    const eb = document.getElementById('err-box'), ob = document.getElementById('off-box');
+    if (d.status==='server_offline') { ob.style.display='block'; eb.style.display='none'; }
+    else if (d.lastError && d.status!=='online') { eb.textContent=d.lastError; eb.style.display='block'; ob.style.display='none'; }
     else { eb.style.display='none'; ob.style.display='none'; }
 
-    // Server pool
-    const sl = document.getElementById('server-list');
+    const sl = document.getElementById('srv-list');
     if (d.servers) sl.innerHTML = d.servers.map(s =>
-      '<div class="server-item'+(s===d.server&&d.status==='online'?' active':'')+'"><span class="sdot"></span>'+esc(s)+(s===d.server&&d.status==='online'?' <span style="color:var(--green);font-size:.72rem;margin-left:auto">● active</span>':'')+'</div>'
+      '<div class="srv-item'+(s===d.server&&d.status==='online'?' active':'')+'"><span class="sdot"></span>'+esc(s)+(s===d.server&&d.status==='online'?'<span style="color:var(--green);font-size:.71rem;margin-left:auto">● active</span>':'')+'</div>'
     ).join('');
 
-    // Stats
     document.getElementById('uptime').textContent = fmt(d.uptime_sec);
     document.getElementById('s-user').textContent  = d.username;
     document.getElementById('s-auth').textContent  = d.auth;
     document.getElementById('s-ver').textContent   = d.version;
     document.getElementById('s-rc').textContent    = d.reconnects;
-    document.getElementById('s-retry').textContent = d.status==='waiting_to_reconnect' ? fmt(Math.round(d.nextRetry/1000)) : '—';
+    document.getElementById('s-lf').textContent    = d.lockFailCount + ' / 5';
+    document.getElementById('s-retry').textContent = d.status==='waiting_to_reconnect'?fmt(Math.round(d.nextRetry/1000)):'—';
 
-    // Device auth
     const ab = document.getElementById('auth-box');
     if (d.deviceAuth) {
       ab.style.display='block';
       document.getElementById('device-code').textContent=d.deviceAuth.userCode;
-      const uri=document.getElementById('device-uri'); uri.href=d.deviceAuth.verificationUri; uri.textContent='Open '+d.deviceAuth.verificationUri+' ↗';
-      document.getElementById('device-expires').textContent='Expires in '+fmt(Math.max(0,Math.floor((d.deviceAuth.expiresAt-Date.now())/1000)));
+      const u=document.getElementById('device-uri'); u.href=d.deviceAuth.verificationUri; u.textContent='Open '+d.deviceAuth.verificationUri+' ↗';
+      document.getElementById('device-exp').textContent='Expires in '+fmt(Math.max(0,Math.floor((d.deviceAuth.expiresAt-Date.now())/1000)));
     } else ab.style.display='none';
 
-    // Chat log
     if (d.chatLog && d.chatLog.length!==lastLen) {
       lastLen=d.chatLog.length;
       const el=document.getElementById('chat-log');
       el.innerHTML=d.chatLog.map(e=>'<div class="chat-entry '+e.source+'"><span class="time">'+fmtT(e.ts)+'</span><span class="user">'+esc(e.username)+'</span>: '+esc(e.message)+'</div>').join('');
       el.scrollTop=el.scrollHeight;
     }
-
     document.getElementById('updated').textContent='Updated '+fmtT(Date.now());
   } catch(_){}
 }
-poll(); setInterval(poll, 3000);
+poll(); setInterval(poll,3000);
 </script>
 </body>
 </html>`;
