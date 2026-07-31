@@ -8,7 +8,7 @@ services:
     healthCheckPath: /health
     envVars:
       - key: BOT_HOST
-        sync: false
+        sync: false          # your server address, e.g. my-server.falixsrv.me
       - key: BOT_PORT
         value: "25565"
       - key: BOT_USERNAME
@@ -16,10 +16,12 @@ services:
       - key: MC_VERSION
         value: "1.20.1"
       - key: BOT_AUTH
-        value: offline
-      - key: BOT_PASSWORD
-        sync: false
+        value: offline       # change to 'microsoft' for premium accounts
       - key: RECONNECT_DELAY
         value: "10000"
       - key: AFK_INTERVAL
         value: "30000"
+      - key: CHAT_PREFIX
+        value: "!"
+      - key: OWNER_USERNAME
+        sync: false          # your in-game username for !stop / !reconnect
