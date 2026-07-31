@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: minecraft-xiter-bot
+    runtime: node
+    buildCommand: npm install
+    startCommand: node index.js
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_HOST
+        sync: false
+      - key: BOT_PORT
+        value: "25565"
+      - key: BOT_USERNAME
+        value: XiterBot
+      - key: MC_VERSION
+        value: "1.20.1"
+      - key: BOT_AUTH
+        value: offline
+      - key: BOT_PASSWORD
+        sync: false
+      - key: RECONNECT_DELAY
+        value: "10000"
+      - key: AFK_INTERVAL
+        value: "30000"
