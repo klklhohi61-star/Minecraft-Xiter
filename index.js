@@ -6,7 +6,7 @@ const path       = require('path');
 // ─── Config ───────────────────────────────────────────────────────────────────
 const CONFIG = {
   host:     process.env.BOT_HOST     || 'villainsmpknowledge.falixsrv.me',
-  port:     parseInt(process.env.BOT_PORT || '25565'),
+  port:     parseInt(process.env.BOT_PORT || '20013'),
   username: process.env.BOT_USERNAME || 'XiterBot',
   version:  process.env.MC_VERSION   || '1.20.1',
   auth:     process.env.BOT_AUTH     || 'offline', // 'offline' | 'microsoft'
