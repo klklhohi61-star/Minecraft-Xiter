@@ -1,7 +1,7 @@
 require('dotenv').config();
 const mineflayer = require('mineflayer');
 const express    = require('express');
-const path       = require('path');
+const net        = require('net');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const CONFIG = {
@@ -9,215 +9,218 @@ const CONFIG = {
   port:     parseInt(process.env.BOT_PORT || '20013'),
   username: process.env.BOT_USERNAME || 'XiterBot',
   version:  process.env.MC_VERSION   || '1.20.1',
-  auth:     process.env.BOT_AUTH     || 'offline', // 'offline' | 'microsoft'
+  auth:     process.env.BOT_AUTH     || 'offline',
 };
 
-const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY || '10000');
-const AFK_INTERVAL_MS    = parseInt(process.env.AFK_INTERVAL    || '30000');
-const OWNER_USERNAME     = process.env.OWNER_USERNAME || '';   // In-game name for admin commands
-const CHAT_PREFIX        = process.env.CHAT_PREFIX    || '!';  // Command prefix
+const RECONNECT_DELAY_MS  = parseInt(process.env.RECONNECT_DELAY || '15000');
+const AFK_INTERVAL_MS     = parseInt(process.env.AFK_INTERVAL    || '30000');
+const OWNER_USERNAME      = process.env.OWNER_USERNAME || '';
+const CHAT_PREFIX         = process.env.CHAT_PREFIX    || '!';
+const TCP_TIMEOUT_MS      = 8000;   // how long to wait for TCP handshake
 
 // ─── State ────────────────────────────────────────────────────────────────────
-let botStatus     = 'starting';
-let botStartTime  = Date.now();
-let reconnectCount = 0;
-let currentServer = CONFIG.host + ':' + CONFIG.port;
-let chatLog       = [];            // last 50 messages
-let deviceAuthPending = null;      // { userCode, verificationUri, expiresAt }
-let afkTimer      = null;
-let reconnectTimer = null;
+let botStatus       = 'starting';
+let botStartTime    = Date.now();
+let reconnectCount  = 0;
+let lastError       = '';
+let currentServer   = CONFIG.host + ':' + CONFIG.port;
+let chatLog         = [];
+let deviceAuthPending = null;
+let afkTimer        = null;
+let reconnectTimer  = null;
+let reconnectDelay  = RECONNECT_DELAY_MS;   // grows with backoff
 
 function addChatLog(source, username, message) {
   const entry = { ts: Date.now(), source, username, message };
   chatLog.push(entry);
   if (chatLog.length > 50) chatLog.shift();
-  return entry;
 }
 
-// Intercept console to catch prismarine-auth device code output
-const _origLog = console.log.bind(console);
+// Intercept console to catch prismarine-auth device code
+const _log = console.log.bind(console);
 console.log = (...args) => {
   const msg = args.join(' ');
-  // Detect Microsoft device auth prompt
-  const codeMatch  = msg.match(/code[:\s]+([A-Z0-9]{8,})/i);
-  const uriMatch   = msg.match(/https:\/\/\S+/);
+  const codeMatch = msg.match(/code[:\s]+([A-Z0-9]{8,})/i);
+  const uriMatch  = msg.match(/https:\/\/\S+/);
   if (codeMatch && uriMatch) {
     deviceAuthPending = {
       userCode:        codeMatch[1],
       verificationUri: uriMatch[0].replace(/[,.]$/, ''),
       expiresAt:       Date.now() + 15 * 60 * 1000,
     };
-    _origLog('[Auth] Device code ready:', deviceAuthPending.userCode);
+    _log('[Auth] Device code:', deviceAuthPending.userCode, '→', deviceAuthPending.verificationUri);
     return;
   }
-  _origLog(...args);
+  _log(...args);
 };
+
+// ─── TCP reachability check ───────────────────────────────────────────────────
+function tcpPing(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    const sock = new net.Socket();
+    let settled = false;
+    const done = (ok, reason) => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      resolve({ ok, reason });
+    };
+    sock.setTimeout(timeoutMs);
+    sock.connect(port, host, () => done(true, 'open'));
+    sock.on('error', e  => done(false, e.message));
+    sock.on('timeout',  () => done(false, 'Timed out — server is offline or port is wrong'));
+  });
+}
 
 // ─── Web dashboard ────────────────────────────────────────────────────────────
 const app  = express();
 const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
-// Serve the dashboard HTML
-app.get('/', (_req, res) => res.send(dashboardHTML()));
+app.get('/',         (_req, res) => res.send(dashboardHTML()));
+app.get('/health',   (_req, res) => res.send('OK'));
+app.get('/api/status', (_req, res) => res.json({
+  status:      botStatus,
+  server:      currentServer,
+  username:    CONFIG.username,
+  auth:        CONFIG.auth,
+  version:     CONFIG.version,
+  uptime_sec:  Math.floor((Date.now() - botStartTime) / 1000),
+  reconnects:  reconnectCount,
+  lastError,
+  nextRetry:   reconnectDelay,
+  deviceAuth:  deviceAuthPending && Date.now() < deviceAuthPending.expiresAt
+                 ? deviceAuthPending : null,
+  chatLog:     chatLog.slice(-20),
+}));
 
-// JSON API for status polling
-app.get('/api/status', (_req, res) => {
-  res.json({
-    status:        botStatus,
-    server:        currentServer,
-    username:      CONFIG.username,
-    auth:          CONFIG.auth,
-    uptime_sec:    Math.floor((Date.now() - botStartTime) / 1000),
-    reconnects:    reconnectCount,
-    deviceAuth:    deviceAuthPending && Date.now() < deviceAuthPending.expiresAt
-                     ? deviceAuthPending : null,
-    chatLog:       chatLog.slice(-20),
-  });
-});
+app.listen(PORT, () => _log('[Web] Dashboard → http://localhost:' + PORT));
 
-// Simple health check
-app.get('/health', (_req, res) => res.send('OK'));
-
-app.listen(PORT, () => _origLog('[Web] Dashboard at http://localhost:' + PORT));
-
-// ─── Anti-AFK actions ─────────────────────────────────────────────────────────
+// ─── Anti-AFK ─────────────────────────────────────────────────────────────────
 const afkActions = [
-  bot => { bot.setControlState('jump',    true);  setTimeout(() => bot.setControlState('jump',    false), 500); },
-  bot => { bot.setControlState('sneak',   true);  setTimeout(() => bot.setControlState('sneak',   false), 800); },
-  bot => { bot.setControlState('forward', true);  setTimeout(() => bot.setControlState('forward', false), 600); },
-  bot => { bot.setControlState('back',    true);  setTimeout(() => bot.setControlState('back',    false), 600); },
-  bot => { bot.setControlState('left',    true);  setTimeout(() => bot.setControlState('left',    false), 600); },
-  bot => { bot.setControlState('right',   true);  setTimeout(() => bot.setControlState('right',   false), 600); },
-  bot => { const yaw = (Math.random() * 2 - 1) * Math.PI; bot.look(yaw, bot.entity.pitch || 0, false); },
-  bot => { bot.swingArm('right'); },
-  bot => { bot.swingArm('left');  },
-  // Spin 360°
-  bot => {
+  b => { b.setControlState('jump',    true); setTimeout(() => b.setControlState('jump',    false), 500); },
+  b => { b.setControlState('sneak',   true); setTimeout(() => b.setControlState('sneak',   false), 800); },
+  b => { b.setControlState('forward', true); setTimeout(() => b.setControlState('forward', false), 600); },
+  b => { b.setControlState('back',    true); setTimeout(() => b.setControlState('back',    false), 600); },
+  b => { b.setControlState('left',    true); setTimeout(() => b.setControlState('left',    false), 600); },
+  b => { b.setControlState('right',   true); setTimeout(() => b.setControlState('right',   false), 600); },
+  b => { b.look((Math.random() * 2 - 1) * Math.PI, 0, false); },
+  b => { b.swingArm('right'); },
+  b => { b.swingArm('left');  },
+  b => {
     let steps = 0;
-    const spin = setInterval(() => {
-      try { bot.look(bot.entity.yaw + Math.PI / 8, 0, false); }
-      catch (_) { clearInterval(spin); }
-      if (++steps >= 16) clearInterval(spin);
+    const id = setInterval(() => {
+      try { b.look(b.entity.yaw + Math.PI / 8, 0, false); } catch (_) { clearInterval(id); }
+      if (++steps >= 16) clearInterval(id);
     }, 60);
   },
 ];
 
-const afkChatMessages = ['.', 'AFK', 'I am here', 'Still online', '👋'];
-let chatIndex = 0;
+const afkChat = ['.', 'AFK', 'I am here', 'Still online'];
+let chatIdx = 0;
 
 function doAntiAfk(bot) {
-  const action = afkActions[Math.floor(Math.random() * afkActions.length)];
-  try { action(bot); } catch (_) {}
-  // Occasionally send a harmless chat message
+  try { afkActions[Math.floor(Math.random() * afkActions.length)](bot); } catch (_) {}
   if (Math.random() < 0.08) {
-    const msg = afkChatMessages[chatIndex % afkChatMessages.length];
-    chatIndex++;
-    try { bot.chat(msg); } catch (_) {}
+    try { bot.chat(afkChat[chatIdx++ % afkChat.length]); } catch (_) {}
   }
 }
 
-// ─── Command handler ──────────────────────────────────────────────────────────
-function handleCommand(bot, sender, message) {
-  const pfx = CHAT_PREFIX;
+// ─── Commands ─────────────────────────────────────────────────────────────────
+function handleCommand(bot, sender, msg) {
+  const p = CHAT_PREFIX;
   const isOwner = !OWNER_USERNAME || sender === OWNER_USERNAME;
-
-  if (message === pfx + 'ping') {
-    bot.chat('Pong! I\'m alive. 🏓');
-  } else if (message === pfx + 'status') {
-    const uptime = Math.floor((Date.now() - botStartTime) / 1000);
-    const h = Math.floor(uptime / 3600), m = Math.floor((uptime % 3600) / 60), s = uptime % 60;
-    bot.chat(`Online ${h}h ${m}m ${s}s | Reconnects: ${reconnectCount} | Server: ${currentServer}`);
-  } else if (message === pfx + 'pos') {
-    const p = bot.entity.position;
-    bot.chat(`Position: ${Math.floor(p.x)}, ${Math.floor(p.y)}, ${Math.floor(p.z)}`);
-  } else if (message === pfx + 'health') {
-    bot.chat(`Health: ${bot.health?.toFixed(1) ?? '?'}/20 | Food: ${bot.food ?? '?'}/20`);
-  } else if (message === pfx + 'players') {
-    const names = Object.keys(bot.players).filter(n => n !== bot.username);
-    if (names.length === 0) bot.chat('No other players online.');
-    else bot.chat('Online: ' + names.slice(0, 10).join(', '));
-  } else if (message === pfx + 'stop' && isOwner) {
-    bot.chat('Stopping. Goodbye!');
-    setTimeout(() => process.exit(0), 1000);
-  } else if (message === pfx + 'reconnect' && isOwner) {
-    bot.chat('Reconnecting...');
-    setTimeout(() => { try { bot.quit(); } catch (_) {} }, 500);
-  } else if (message === pfx + 'help') {
-    bot.chat(`Commands: ${pfx}ping ${pfx}status ${pfx}pos ${pfx}health ${pfx}players${isOwner ? ` ${pfx}stop ${pfx}reconnect` : ''}`);
+  if (msg === p + 'ping')   bot.chat('Pong! I\'m alive. 🏓');
+  else if (msg === p + 'status') {
+    const u = Math.floor((Date.now() - botStartTime) / 1000);
+    bot.chat(`Up ${Math.floor(u/3600)}h${Math.floor((u%3600)/60)}m${u%60}s | Reconnects: ${reconnectCount}`);
   }
+  else if (msg === p + 'pos') {
+    const p2 = bot.entity.position;
+    bot.chat(`Pos: ${Math.floor(p2.x)}, ${Math.floor(p2.y)}, ${Math.floor(p2.z)}`);
+  }
+  else if (msg === p + 'health') bot.chat(`HP: ${bot.health?.toFixed(1)??'?'}/20  Food: ${bot.food??'?'}/20`);
+  else if (msg === p + 'players') {
+    const names = Object.keys(bot.players).filter(n => n !== bot.username);
+    bot.chat(names.length ? 'Online: ' + names.slice(0,10).join(', ') : 'No other players.');
+  }
+  else if (msg === p + 'help')      bot.chat(`Commands: ${p}ping ${p}status ${p}pos ${p}health ${p}players${isOwner?` ${p}stop ${p}reconnect`:''}`);
+  else if (msg === p + 'reconnect' && isOwner) { bot.chat('Reconnecting…'); setTimeout(() => { try { bot.quit(); } catch(_){} }, 500); }
+  else if (msg === p + 'stop'      && isOwner) { bot.chat('Stopping. Goodbye!'); setTimeout(() => process.exit(0), 1000); }
 }
 
 // ─── Bot factory ──────────────────────────────────────────────────────────────
-function createBot() {
-  _origLog('[Bot] Connecting to ' + CONFIG.host + ':' + CONFIG.port + ' as ' + CONFIG.username + ' (' + CONFIG.auth + ' auth)...');
+async function createBot() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
+  // ── 1. TCP reachability check ────────────────────────────────────────────
+  _log(`[Bot] Checking ${CONFIG.host}:${CONFIG.port} …`);
+  botStatus = 'checking_server';
+  lastError = '';
+
+  const ping = await tcpPing(CONFIG.host, CONFIG.port, TCP_TIMEOUT_MS);
+  if (!ping.ok) {
+    lastError = ping.reason;
+    _log(`[Bot] Server not reachable: ${ping.reason}`);
+    botStatus = 'server_offline';
+    addChatLog('system', 'Bot', `Server not reachable: ${ping.reason}`);
+    scheduleReconnect();
+    return;
+  }
+
+  // ── 2. Connect via mineflayer ────────────────────────────────────────────
+  _log(`[Bot] Server is up — connecting as ${CONFIG.username} (${CONFIG.auth})…`);
   botStatus = 'connecting';
   deviceAuthPending = null;
 
-  const botOptions = {
-    host:     CONFIG.host,
-    port:     CONFIG.port,
-    username: CONFIG.username,
-    version:  CONFIG.version,
-    auth:     CONFIG.auth,
-  };
-
   let bot;
   try {
-    bot = mineflayer.createBot(botOptions);
+    bot = mineflayer.createBot({
+      host:     CONFIG.host,
+      port:     CONFIG.port,
+      username: CONFIG.username,
+      version:  CONFIG.version,
+      auth:     CONFIG.auth,
+    });
   } catch (err) {
-    _origLog('[Bot] Failed to create bot:', err.message);
+    lastError = err.message;
+    _log('[Bot] Failed to create bot:', err.message);
     scheduleReconnect();
     return;
   }
 
   bot.once('spawn', () => {
-    _origLog('[Bot] Spawned! Anti-AFK active. Server: ' + currentServer);
+    _log('[Bot] Spawned! Anti-AFK active.');
     botStatus = 'online';
+    lastError = '';
     deviceAuthPending = null;
+    reconnectDelay = RECONNECT_DELAY_MS;   // reset backoff on success
     afkTimer = setInterval(() => doAntiAfk(bot), AFK_INTERVAL_MS);
     addChatLog('system', 'Bot', 'Connected to ' + currentServer);
   });
 
-  bot.on('chat', (username, message) => {
-    if (username === bot.username) return;
-    _origLog('[Chat] <' + username + '> ' + message);
-    addChatLog('chat', username, message);
-    if (message.startsWith(CHAT_PREFIX)) {
-      try { handleCommand(bot, username, message); } catch (_) {}
-    }
-  });
-
-  bot.on('whisper', (username, message) => {
-    _origLog('[Whisper] ' + username + ' -> ' + message);
-    addChatLog('whisper', username, message);
-    if (message.startsWith(CHAT_PREFIX)) {
-      try { handleCommand(bot, username, message); } catch (_) {}
-    }
-  });
-
-  bot.on('message', (jsonMsg) => {
-    const txt = jsonMsg.toString();
-    if (txt && !chatLog.find(e => e.message === txt && Date.now() - e.ts < 1000)) {
-      addChatLog('server', 'Server', txt);
-    }
-  });
+  bot.on('chat',    (u, m) => { if (u === bot.username) return; _log(`[Chat] <${u}> ${m}`); addChatLog('chat', u, m); if (m.startsWith(CHAT_PREFIX)) try { handleCommand(bot, u, m); } catch(_){} });
+  bot.on('whisper', (u, m) => { _log(`[Whisper] ${u}: ${m}`); addChatLog('whisper', u, m); if (m.startsWith(CHAT_PREFIX)) try { handleCommand(bot, u, m); } catch(_){} });
 
   bot.on('kicked', reason => {
-    _origLog('[Bot] Kicked:', typeof reason === 'string' ? reason : JSON.stringify(reason));
+    const r = typeof reason === 'string' ? reason : JSON.stringify(reason);
+    lastError = 'Kicked: ' + r;
+    _log('[Bot] Kicked:', r);
     botStatus = 'kicked';
-    addChatLog('system', 'Bot', 'Kicked from server');
+    addChatLog('system', 'Bot', 'Kicked: ' + r);
     cleanup(); scheduleReconnect();
   });
 
   bot.on('error', err => {
-    _origLog('[Bot] Error:', err.message);
+    lastError = err.message;
+    _log('[Bot] Error:', err.message);
     botStatus = 'error';
     cleanup(); scheduleReconnect();
   });
 
   bot.on('end', reason => {
-    _origLog('[Bot] Ended:', reason);
+    _log('[Bot] Ended:', reason);
+    lastError = reason || '';
     botStatus = 'disconnected';
     addChatLog('system', 'Bot', 'Disconnected: ' + reason);
     cleanup(); scheduleReconnect();
@@ -230,11 +233,13 @@ function createBot() {
 }
 
 function scheduleReconnect() {
-  if (reconnectTimer) return; // already scheduled
+  if (reconnectTimer) return;
   reconnectCount++;
-  _origLog('[Bot] Reconnecting in ' + (RECONNECT_DELAY_MS / 1000) + 's... (attempt #' + reconnectCount + ')');
+  _log(`[Bot] Retry #${reconnectCount} in ${reconnectDelay / 1000}s…`);
   botStatus = 'waiting_to_reconnect';
-  reconnectTimer = setTimeout(() => { reconnectTimer = null; createBot(); }, RECONNECT_DELAY_MS);
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; createBot(); }, reconnectDelay);
+  // Exponential backoff: 15s → 30s → 60s → 120s (cap)
+  reconnectDelay = Math.min(reconnectDelay * 2, 120_000);
 }
 
 createBot();
@@ -244,216 +249,181 @@ function dashboardHTML() {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Minecraft-Xiter Bot Dashboard</title>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Minecraft-Xiter Dashboard</title>
   <style>
-    :root {
-      --bg: #0f1117; --card: #1a1d27; --border: #2a2d3e;
-      --green: #4ade80; --yellow: #facc15; --red: #f87171; --blue: #60a5fa;
-      --text: #e2e8f0; --muted: #64748b;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; min-height: 100vh; }
-    header {
-      background: var(--card); border-bottom: 1px solid var(--border);
-      padding: 16px 24px; display: flex; align-items: center; gap: 12px;
-    }
-    header img { width: 36px; height: 36px; image-rendering: pixelated; }
-    header h1 { font-size: 1.3rem; font-weight: 700; }
-    header span { font-size: 0.8rem; color: var(--muted); margin-left: auto; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 20px 24px; max-width: 1100px; margin: 0 auto; }
-    @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; }
-    .card h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 12px; }
-    .status-badge {
-      display: inline-flex; align-items: center; gap: 6px;
-      padding: 4px 12px; border-radius: 999px; font-size: 0.85rem; font-weight: 600;
-    }
-    .dot { width: 8px; height: 8px; border-radius: 50%; }
-    .online   { background: rgba(74,222,128,.15); color: var(--green); }
-    .online .dot { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 1.5s infinite; }
-    .error, .kicked { background: rgba(248,113,113,.15); color: var(--red); }
-    .error .dot, .kicked .dot { background: var(--red); }
-    .connecting, .waiting_to_reconnect, .starting {
-      background: rgba(250,204,21,.12); color: var(--yellow);
-    }
-    .connecting .dot, .waiting_to_reconnect .dot, .starting .dot { background: var(--yellow); animation: pulse 1s infinite; }
-    .disconnected { background: rgba(100,116,139,.15); color: var(--muted); }
-    .disconnected .dot { background: var(--muted); }
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
-    .stat-row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 0.88rem; }
-    .stat-row:last-child { border-bottom: none; }
-    .stat-row .label { color: var(--muted); }
-    .stat-row .value { font-weight: 500; }
-    .auth-box {
-      background: rgba(250,204,21,.08); border: 1px solid rgba(250,204,21,.3);
-      border-radius: 10px; padding: 14px; margin-top: 8px;
-    }
-    .auth-box h3 { color: var(--yellow); font-size: 0.9rem; margin-bottom: 8px; }
-    .code { font-family: monospace; font-size: 1.5rem; letter-spacing: .2em; color: var(--yellow); font-weight: 700; }
-    .auth-box a { color: var(--blue); font-size: 0.85rem; }
-    .auth-box p { font-size: 0.8rem; color: var(--muted); margin-top: 6px; }
-    .chat-log { height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
-    .chat-entry { font-size: 0.82rem; line-height: 1.4; padding: 2px 0; }
-    .chat-entry .time { color: var(--muted); margin-right: 6px; font-size: 0.75rem; }
-    .chat-entry .user { font-weight: 600; }
-    .chat-entry.chat  .user { color: var(--green); }
-    .chat-entry.whisper .user { color: var(--blue); }
-    .chat-entry.system .user { color: var(--muted); font-style: italic; }
-    .chat-entry.server .user { color: var(--yellow); }
-    .chat-log::-webkit-scrollbar { width: 4px; }
-    .chat-log::-webkit-scrollbar-track { background: var(--border); border-radius: 2px; }
-    .chat-log::-webkit-scrollbar-thumb { background: var(--muted); border-radius: 2px; }
-    .wide { grid-column: 1 / -1; }
-    .uptime { font-size: 1.6rem; font-weight: 700; color: var(--green); }
-    .commands code {
-      display: inline-block; background: rgba(96,165,250,.1); color: var(--blue);
-      border: 1px solid rgba(96,165,250,.2); border-radius: 6px;
-      padding: 2px 8px; font-size: 0.8rem; margin: 2px;
-    }
-    footer { text-align: center; color: var(--muted); font-size: 0.75rem; padding: 24px; }
+    :root{--bg:#0f1117;--card:#1a1d27;--border:#2a2d3e;--green:#4ade80;--yellow:#facc15;--red:#f87171;--blue:#60a5fa;--orange:#fb923c;--text:#e2e8f0;--muted:#64748b}
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}
+    header{background:var(--card);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;align-items:center;gap:12px}
+    header h1{font-size:1.25rem;font-weight:700}
+    header span{font-size:.78rem;color:var(--muted);margin-left:auto}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:20px 24px;max-width:1100px;margin:0 auto}
+    @media(max-width:680px){.grid{grid-template-columns:1fr}}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 20px}
+    .card h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:12px}
+    .badge{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:999px;font-size:.85rem;font-weight:600}
+    .dot{width:8px;height:8px;border-radius:50%}
+    .online{background:rgba(74,222,128,.15);color:var(--green)}.online .dot{background:var(--green);box-shadow:0 0 6px var(--green);animation:p 1.5s infinite}
+    .error,.kicked{background:rgba(248,113,113,.15);color:var(--red)}.error .dot,.kicked .dot{background:var(--red)}
+    .connecting,.waiting_to_reconnect,.starting,.checking_server{background:rgba(250,204,21,.12);color:var(--yellow)}.connecting .dot,.waiting_to_reconnect .dot,.starting .dot,.checking_server .dot{background:var(--yellow);animation:p 1s infinite}
+    .server_offline{background:rgba(251,146,60,.12);color:var(--orange)}.server_offline .dot{background:var(--orange)}
+    .disconnected{background:rgba(100,116,139,.15);color:var(--muted)}.disconnected .dot{background:var(--muted)}
+    @keyframes p{0%,100%{opacity:1}50%{opacity:.35}}
+    .error-box{background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.25);border-radius:8px;padding:10px 12px;margin-top:10px;font-size:.82rem;color:var(--red);word-break:break-all}
+    .offline-help{background:rgba(251,146,60,.08);border:1px solid rgba(251,146,60,.25);border-radius:8px;padding:10px 12px;margin-top:10px;font-size:.82rem;color:var(--orange)}
+    .offline-help ul{margin-left:16px;margin-top:4px;line-height:1.7}
+    .stat-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);font-size:.87rem}
+    .stat-row:last-child{border-bottom:none}
+    .stat-row .label{color:var(--muted)}
+    .stat-row .value{font-weight:500}
+    .auth-box{background:rgba(250,204,21,.08);border:1px solid rgba(250,204,21,.3);border-radius:10px;padding:14px;margin-top:8px}
+    .auth-box h3{color:var(--yellow);font-size:.9rem;margin-bottom:8px}
+    .code{font-family:monospace;font-size:1.5rem;letter-spacing:.2em;color:var(--yellow);font-weight:700}
+    .auth-box a{color:var(--blue);font-size:.85rem}
+    .auth-box p{font-size:.8rem;color:var(--muted);margin-top:6px}
+    .chat-log{height:240px;overflow-y:auto;display:flex;flex-direction:column;gap:4px}
+    .chat-entry{font-size:.81rem;line-height:1.4;padding:2px 0}
+    .chat-entry .time{color:var(--muted);margin-right:5px;font-size:.73rem}
+    .chat-entry .user{font-weight:600}
+    .chat-entry.chat .user{color:var(--green)}
+    .chat-entry.whisper .user{color:var(--blue)}
+    .chat-entry.system .user{color:var(--muted);font-style:italic}
+    .chat-log::-webkit-scrollbar{width:4px}
+    .chat-log::-webkit-scrollbar-thumb{background:var(--muted);border-radius:2px}
+    .wide{grid-column:1/-1}
+    .uptime{font-size:1.5rem;font-weight:700;color:var(--green)}
+    .commands code{display:inline-block;background:rgba(96,165,250,.1);color:var(--blue);border:1px solid rgba(96,165,250,.2);border-radius:6px;padding:2px 8px;font-size:.78rem;margin:2px}
+    footer{text-align:center;color:var(--muted);font-size:.73rem;padding:24px}
   </style>
 </head>
 <body>
-  <header>
-    <svg width="36" height="36" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <rect width="16" height="16" rx="3" fill="#1a1d27"/>
-      <rect x="5" y="2" width="6" height="6" rx="1" fill="#c6a878"/>
-      <rect x="6" y="3" width="1" height="1" fill="#3a2a1a"/>
-      <rect x="9" y="3" width="1" height="1" fill="#3a2a1a"/>
-      <rect x="6" y="5" width="4" height="1" fill="#3a2a1a"/>
-      <rect x="4" y="8" width="8" height="6" rx="1" fill="#4ade80"/>
-      <rect x="2" y="9" width="3" height="4" rx="1" fill="#4ade80"/>
-      <rect x="11" y="9" width="3" height="4" rx="1" fill="#4ade80"/>
-      <rect x="5" y="11" width="3" height="3" rx="0.5" fill="#1a1d27"/>
-      <rect x="8" y="11" width="3" height="3" rx="0.5" fill="#1a1d27"/>
-    </svg>
-    <h1>Minecraft-Xiter Dashboard</h1>
-    <span id="updated">Updating…</span>
-  </header>
+<header>
+  <svg width="32" height="32" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
+    <rect width="16" height="16" rx="3" fill="#1a1d27"/>
+    <rect x="5" y="2" width="6" height="6" rx="1" fill="#c6a878"/>
+    <rect x="6" y="3" width="1" height="1" fill="#3a2a1a"/><rect x="9" y="3" width="1" height="1" fill="#3a2a1a"/>
+    <rect x="6" y="5" width="4" height="1" fill="#3a2a1a"/>
+    <rect x="4" y="8" width="8" height="6" rx="1" fill="#4ade80"/>
+    <rect x="2" y="9" width="3" height="4" rx="1" fill="#4ade80"/>
+    <rect x="11" y="9" width="3" height="4" rx="1" fill="#4ade80"/>
+    <rect x="5" y="11" width="3" height="3" rx=".5" fill="#1a1d27"/>
+    <rect x="8" y="11" width="3" height="3" rx=".5" fill="#1a1d27"/>
+  </svg>
+  <h1>Minecraft-Xiter Dashboard</h1>
+  <span id="updated">Loading…</span>
+</header>
 
-  <div class="grid">
-    <!-- Status -->
-    <div class="card">
-      <h2>Bot Status</h2>
-      <div id="status-badge" class="status-badge starting"><span class="dot"></span> <span id="status-text">Starting…</span></div>
-      <div id="auth-box" style="display:none" class="auth-box">
-        <h3>🔑 Microsoft Login Required</h3>
-        <p>Open the link below and enter this code:</p>
-        <div class="code" id="device-code">——</div>
-        <a id="device-uri" href="#" target="_blank" rel="noopener">Open microsoft.com/devicelogin ↗</a>
-        <p id="device-expires"></p>
-      </div>
+<div class="grid">
+  <div class="card">
+    <h2>Bot Status</h2>
+    <div id="badge" class="badge starting"><span class="dot"></span><span id="status-text">Starting…</span></div>
+    <div id="error-box"  style="display:none" class="error-box"></div>
+    <div id="offline-help" style="display:none" class="offline-help">
+      <strong>Server appears offline.</strong>
+      <ul>
+        <li>Log in to <a href="https://client.falixnodes.net" target="_blank" style="color:var(--orange)">FalixNodes</a> and make sure your server is <strong>started</strong></li>
+        <li>Confirm the address is exactly: <code style="background:rgba(255,255,255,.07);padding:1px 5px;border-radius:4px" id="server-addr">—</code></li>
+        <li>The bot will keep retrying automatically</li>
+      </ul>
     </div>
-
-    <!-- Stats -->
-    <div class="card">
-      <h2>Stats</h2>
-      <div id="uptime" class="uptime">—</div>
-      <div style="margin-top:10px">
-        <div class="stat-row"><span class="label">Server</span><span class="value" id="server">—</span></div>
-        <div class="stat-row"><span class="label">Username</span><span class="value" id="username">—</span></div>
-        <div class="stat-row"><span class="label">Auth mode</span><span class="value" id="auth-mode">—</span></div>
-        <div class="stat-row"><span class="label">Reconnects</span><span class="value" id="reconnects">0</span></div>
-      </div>
-    </div>
-
-    <!-- Chat log -->
-    <div class="card wide">
-      <h2>Chat Log (last 20 messages)</h2>
-      <div class="chat-log" id="chat-log"><span style="color:var(--muted);font-size:.82rem">Waiting for messages…</span></div>
-    </div>
-
-    <!-- Commands -->
-    <div class="card wide">
-      <h2>In-game Commands (type in Minecraft chat)</h2>
-      <div class="commands" id="commands-list">
-        <code>!ping</code>
-        <code>!status</code>
-        <code>!pos</code>
-        <code>!health</code>
-        <code>!players</code>
-        <code>!help</code>
-        <code>!reconnect</code> (owner only)
-        <code>!stop</code> (owner only)
-      </div>
-      <p style="font-size:.78rem;color:var(--muted);margin-top:10px">
-        Set <code>CHAT_PREFIX</code> env var to change the prefix. Set <code>OWNER_USERNAME</code> to restrict admin commands.
-      </p>
+    <div id="auth-box" style="display:none" class="auth-box">
+      <h3>🔑 Microsoft Login Required</h3>
+      <p>Open the link and enter this code:</p>
+      <div class="code" id="device-code">——</div>
+      <a id="device-uri" href="#" target="_blank">Open microsoft.com/devicelogin ↗</a>
+      <p id="device-expires"></p>
     </div>
   </div>
 
-  <footer>Minecraft-Xiter &nbsp;|&nbsp; AFK bot for FalixNodes / Render.com</footer>
+  <div class="card">
+    <h2>Stats</h2>
+    <div id="uptime" class="uptime">—</div>
+    <div style="margin-top:10px">
+      <div class="stat-row"><span class="label">Server</span><span class="value" id="s-server">—</span></div>
+      <div class="stat-row"><span class="label">Username</span><span class="value" id="s-user">—</span></div>
+      <div class="stat-row"><span class="label">Version</span><span class="value" id="s-ver">—</span></div>
+      <div class="stat-row"><span class="label">Auth</span><span class="value" id="s-auth">—</span></div>
+      <div class="stat-row"><span class="label">Reconnects</span><span class="value" id="s-rc">0</span></div>
+      <div class="stat-row"><span class="label">Next retry</span><span class="value" id="s-retry">—</span></div>
+    </div>
+  </div>
 
-  <script>
-    function fmt(sec) {
-      const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-      return (h ? h + 'h ' : '') + (m ? m + 'm ' : '') + s + 's';
-    }
-    function fmtTime(ts) {
-      const d = new Date(ts);
-      return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0') + ':' + d.getSeconds().toString().padStart(2,'0');
-    }
+  <div class="card wide">
+    <h2>Chat Log</h2>
+    <div class="chat-log" id="chat-log"><span style="color:var(--muted);font-size:.82rem">Waiting for messages…</span></div>
+  </div>
 
-    let lastChatLen = 0;
+  <div class="card wide">
+    <h2>In-game Commands</h2>
+    <div class="commands">
+      <code>!ping</code><code>!status</code><code>!pos</code><code>!health</code>
+      <code>!players</code><code>!help</code><code>!reconnect</code><code>!stop</code>
+    </div>
+    <p style="font-size:.76rem;color:var(--muted);margin-top:8px">Set <code>OWNER_USERNAME</code> to your IGN to unlock !stop and !reconnect.</p>
+  </div>
+</div>
 
-    async function poll() {
-      try {
-        const r = await fetch('/api/status');
-        const d = await r.json();
+<footer>Minecraft-Xiter — AFK bot for FalixNodes / Render.com</footer>
 
-        // Status badge
-        const badge = document.getElementById('status-badge');
-        badge.className = 'status-badge ' + d.status;
-        document.getElementById('status-text').textContent = d.status.replace(/_/g, ' ');
+<script>
+  const fmt = s => (Math.floor(s/3600)?Math.floor(s/3600)+'h ':'')+(Math.floor((s%3600)/60)?Math.floor((s%3600)/60)+'m ':'')+(s%60)+'s';
+  const fmtT = ts => { const d=new Date(ts); return [d.getHours(),d.getMinutes(),d.getSeconds()].map(n=>String(n).padStart(2,'0')).join(':'); };
+  const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  let lastLen = 0;
 
-        // Stats
-        document.getElementById('uptime').textContent = fmt(d.uptime_sec);
-        document.getElementById('server').textContent = d.server;
-        document.getElementById('username').textContent = d.username;
-        document.getElementById('auth-mode').textContent = d.auth;
-        document.getElementById('reconnects').textContent = d.reconnects;
+  async function poll() {
+    try {
+      const d = await fetch('/api/status').then(r=>r.json());
 
-        // Device auth
-        const authBox = document.getElementById('auth-box');
-        if (d.deviceAuth) {
-          authBox.style.display = 'block';
-          document.getElementById('device-code').textContent = d.deviceAuth.userCode;
-          const uri = document.getElementById('device-uri');
-          uri.href = d.deviceAuth.verificationUri;
-          uri.textContent = 'Open ' + d.deviceAuth.verificationUri + ' ↗';
-          const remaining = Math.max(0, Math.floor((d.deviceAuth.expiresAt - Date.now()) / 1000));
-          document.getElementById('device-expires').textContent = 'Code expires in ' + fmt(remaining);
-        } else {
-          authBox.style.display = 'none';
-        }
+      // Badge
+      const badge = document.getElementById('badge');
+      badge.className = 'badge ' + d.status;
+      document.getElementById('status-text').textContent = d.status.replace(/_/g,' ');
 
-        // Chat log
-        if (d.chatLog && d.chatLog.length !== lastChatLen) {
-          lastChatLen = d.chatLog.length;
-          const log = document.getElementById('chat-log');
-          log.innerHTML = d.chatLog.map(e =>
-            '<div class="chat-entry ' + e.source + '">' +
-            '<span class="time">' + fmtTime(e.ts) + '</span>' +
-            '<span class="user">' + escHtml(e.username) + '</span>: ' +
-            escHtml(e.message) +
-            '</div>'
-          ).join('');
-          log.scrollTop = log.scrollHeight;
-        }
+      // Error box
+      const eb = document.getElementById('error-box');
+      const oh = document.getElementById('offline-help');
+      document.getElementById('server-addr').textContent = d.server;
+      if (d.lastError && d.status !== 'online') { eb.textContent = d.lastError; eb.style.display='block'; } else { eb.style.display='none'; }
+      oh.style.display = d.status === 'server_offline' ? 'block' : 'none';
 
-        document.getElementById('updated').textContent = 'Updated ' + fmtTime(Date.now());
-      } catch(_) {}
-    }
+      // Stats
+      document.getElementById('uptime').textContent = fmt(d.uptime_sec);
+      document.getElementById('s-server').textContent = d.server;
+      document.getElementById('s-user').textContent   = d.username;
+      document.getElementById('s-ver').textContent    = d.version;
+      document.getElementById('s-auth').textContent   = d.auth;
+      document.getElementById('s-rc').textContent     = d.reconnects;
+      document.getElementById('s-retry').textContent  = d.status === 'waiting_to_reconnect' ? fmt(Math.round(d.nextRetry/1000)) : '—';
 
-    function escHtml(s) {
-      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    }
+      // Device auth
+      const ab = document.getElementById('auth-box');
+      if (d.deviceAuth) {
+        ab.style.display='block';
+        document.getElementById('device-code').textContent = d.deviceAuth.userCode;
+        const uri = document.getElementById('device-uri');
+        uri.href = d.deviceAuth.verificationUri;
+        uri.textContent = 'Open ' + d.deviceAuth.verificationUri + ' ↗';
+        document.getElementById('device-expires').textContent = 'Expires in ' + fmt(Math.max(0,Math.floor((d.deviceAuth.expiresAt-Date.now())/1000)));
+      } else { ab.style.display='none'; }
 
-    poll();
-    setInterval(poll, 3000);
-  </script>
+      // Chat log
+      if (d.chatLog && d.chatLog.length !== lastLen) {
+        lastLen = d.chatLog.length;
+        const el = document.getElementById('chat-log');
+        el.innerHTML = d.chatLog.map(e =>
+          '<div class="chat-entry '+e.source+'"><span class="time">'+fmtT(e.ts)+'</span><span class="user">'+esc(e.username)+'</span>: '+esc(e.message)+'</div>'
+        ).join('');
+        el.scrollTop = el.scrollHeight;
+      }
+
+      document.getElementById('updated').textContent = 'Updated ' + fmtT(Date.now());
+    } catch(_){}
+  }
+  poll(); setInterval(poll, 3000);
+</script>
 </body>
 </html>`;
 }
